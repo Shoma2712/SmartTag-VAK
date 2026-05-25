@@ -1,0 +1,557 @@
+# БЛОК 5: Кластеризация на эмбеддингах
+import time
+from pathlib import Path
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
+from sklearn.metrics import silhouette_score, silhouette_samples
+from sklearn.preprocessing import normalize
+import warnings
+import logging
+import os
+
+warnings.filterwarnings("ignore")
+logging.getLogger("transformers").setLevel(logging.ERROR)
+logging.getLogger("sentence_transformers").setLevel(logging.ERROR)
+os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
+def normalize_text(s: str) -> str:
+    """
+    Нормализация текста.
+
+    Args:
+        s (str): Исходный текст
+
+    Returns:
+        str: Нормализованный текст
+    """
+    return " ".join(str(s or "").replace("\xa0", " ").split())
+
+
+def build_text_views(row: pd.Series) -> dict:
+    """
+    Строит различные представления текста для эмбеддингов.
+
+    Args:
+        row (pd.Series): Строка DataFrame
+
+    Returns:
+        dict: Словарь с представлениями текста
+    """
+    title = normalize_text(row.get("title", ""))
+    ann = normalize_text(row.get("annotation", ""))
+    kw = normalize_text(row.get("keywords", ""))
+    mt = normalize_text(row.get("main_text", ""))
+    ct = normalize_text(row.get("clean_text", ""))
+    view_title_ann_kw = normalize_text(f"{title}. {ann}. {kw}.")
+
+    MAX_CHARS = 9000
+    main_truncated = mt[:MAX_CHARS] if len(mt) > MAX_CHARS else mt
+    clean_truncated = ct[:MAX_CHARS] if len(ct) > MAX_CHARS else ct
+    return {
+        "title_ann_kw": view_title_ann_kw,
+        "title_ann_kw_mt": main_truncated,
+        "title_ann_kw_ct": clean_truncated,
+    }
+
+
+def load_embedding_model(model_name: str, allow_download: bool = True):
+    """
+    Загружает модель для создания эмбеддингов.
+
+    Args:
+        model_name (str): Название модели
+        allow_download (bool): Разрешить загрузку модели
+
+    Returns:
+        tuple: (модель, описание_источника)
+    """
+    from sentence_transformers import SentenceTransformer
+
+    local_only = not allow_download
+
+    try:
+        model = SentenceTransformer(model_name, local_files_only=local_only)
+        return model, f"auto:{model_name}"
+    except Exception as exc:
+        raise RuntimeError(f"Не удалось загрузить модель '{model_name}': {exc}")
+
+
+def encode_texts(model, texts: list, batch_size: int = 32) -> np.ndarray:
+    """
+    Создает эмбеддинги для текстов.
+
+    Args:
+        model: Модель sentence-transformers
+        texts (list): Список текстов
+        batch_size (int): Размер батча
+
+    Returns:
+        np.ndarray: Матрица эмбеддингов
+    """
+    x = model.encode(
+        texts,
+        batch_size=batch_size,
+        show_progress_bar=True,
+        normalize_embeddings=True,
+        convert_to_numpy=True,
+    )
+    x = np.asarray(x, dtype=np.float32)
+    return normalize(x)
+
+
+def evaluate_k_range(x: np.ndarray, k_values: list, sample_size: int = 500, random_state: int = 42) -> pd.DataFrame:
+    """
+    Оценивает качество кластеризации для разных значений k.
+
+    Args:
+        x (np.ndarray): Матрица эмбеддингов
+        k_values (list): Список значений k для проверки
+        sample_size (int): Размер выборки для silhouette
+        random_state (int): Random state
+
+    Returns:
+        pd.DataFrame: DataFrame с метриками для каждого k
+    """
+    rows = []
+    for k in k_values:
+        labels = KMeans(n_clusters=k, random_state=random_state, n_init=20).fit_predict(x)
+
+        sil = silhouette_score(
+            x,
+            labels,
+            metric="cosine",
+            sample_size=min(sample_size, len(x)),
+            random_state=random_state,
+        )
+
+        rows.append({
+            "k": int(k),
+            "silhouette": float(sil),
+        })
+
+    return pd.DataFrame(rows)
+
+
+class EmbeddingClusterer:
+    """
+    Класс для кластеризации текстов на основе эмбеддингов.
+    """
+
+    def __init__(self, df: pd.DataFrame, random_state: int = 42):
+        """
+        Инициализация кластеризатора.
+
+        Args:
+            df (pd.DataFrame): DataFrame с данными
+            random_state (int): Random state для воспроизводимости
+        """
+        self.df = df.copy()
+        self.random_state = random_state
+        self.encoded_cache = {}
+
+    def prepare_data(self, text_views: dict = None):
+        """
+        Подготовка данных для кластеризации.
+
+        Args:
+            text_views (dict): Словарь с описаниями представлений текста
+        """
+        if text_views is None:
+            text_views = {
+                "title_ann_kw": "title + annotation + keywords",
+                "title_ann_kw_mt": "title+ann+kw+main",
+                "title_ann_kw_ct": "title+ann+kw+clean",
+            }
+
+        self.text_views = text_views
+
+        # Строим представления текста
+        print("Построение представлений текста...")
+        views_df = self.df.apply(build_text_views, axis=1, result_type="expand")
+        for view_col in text_views:
+            self.df[view_col] = views_df[view_col].fillna("").map(normalize_text)
+
+        # Фильтрация данных
+        TOPIC_NO_CONTENTS = "Тема не указана в содержании"
+        TOPIC_UNDEFINED = "Тема не определена"
+
+        mask_unspecified = (
+            (self.df["topic"] == TOPIC_NO_CONTENTS) |
+            (self.df["topic"] == TOPIC_UNDEFINED) |
+            (self.df["topic"].isna()) |
+            (self.df["topic"].astype(str).str.strip() == "")
+        )
+
+        if mask_unspecified.any():
+            removed_count = int(mask_unspecified.sum())
+            removed_topics = self.df.loc[mask_unspecified, "topic"].value_counts().to_dict()
+            print(f"Удалено статей с неопределённой темой: {removed_count}")
+            print("Удалённые темы:", removed_topics)
+
+        self.df = self.df[~mask_unspecified].copy().reset_index(drop=True)
+
+        # Фильтруем пустые тексты
+        mask_non_empty = self.df[list(text_views.keys())].apply(lambda s: s.str.strip() != "").any(axis=1)
+        self.df = self.df[mask_non_empty].copy().reset_index(drop=True)
+
+        print(f"Размер датасета: {len(self.df)} | уникальные темы: {self.df['topic'].nunique()}")
+
+    def encode_with_model(self, model_name: str, text_view: str, batch_size: int = 32):
+        """
+        Создает эмбеддинги для текстов с помощью модели.
+
+        Args:
+            model_name (str): Название модели
+            text_view (str): Представление текста
+            batch_size (int): Размер батча
+
+        Returns:
+            np.ndarray: Матрица эмбеддингов
+        """
+        cache_key = (model_name, text_view)
+        if cache_key in self.encoded_cache:
+            print(f"Используем кэшированные эмбеддинги для {model_name} | {text_view}")
+            return self.encoded_cache[cache_key]
+
+        print(f"Создание эмбеддингов: {model_name} | {text_view}")
+        model, model_source = load_embedding_model(model_name)
+
+        texts = self.df[text_view].tolist()
+        x = encode_texts(model, texts, batch_size=batch_size)
+
+        self.encoded_cache[cache_key] = x
+        return x
+
+    def find_optimal_k(self, x: np.ndarray, min_k: int = 5, max_k: int = 50, sample_size: int = 500):
+        """
+        Находит оптимальное количество кластеров.
+
+        Args:
+            x (np.ndarray): Матрица эмбеддингов
+            min_k (int): Минимальное количество кластеров
+            max_k (int): Максимальное количество кластеров
+            sample_size (int): Размер выборки для silhouette
+
+        Returns:
+            pd.DataFrame: DataFrame с метриками
+        """
+        n = len(x)
+        min_k = max(2, min(min_k, n - 2))
+        max_k = min(max_k, n - 1)
+
+        if min_k >= max_k:
+            raise RuntimeError("Слишком мало объектов для подбора k.")
+
+        k_values = list(range(min_k, max_k + 1))
+        return evaluate_k_range(x, k_values, sample_size=sample_size, random_state=self.random_state)
+
+    def cluster(self, x: np.ndarray, k: int):
+        """
+        Выполняет кластеризацию.
+
+        Args:
+            x (np.ndarray): Матрица эмбеддингов
+            k (int): Количество кластеров
+
+        Returns:
+            np.ndarray: Метки кластеров
+        """
+        print(f"Кластеризация с k={k}...")
+        labels = KMeans(n_clusters=k, random_state=self.random_state, n_init=20).fit_predict(x)
+        return labels
+
+    def compute_tsne(self, x: np.ndarray, pca_dim: int = 50):
+        """
+        Вычисляет t-SNE для визуализации.
+
+        Args:
+            x (np.ndarray): Матрица эмбеддингов
+            pca_dim (int): Размерность PCA перед t-SNE
+
+        Returns:
+            np.ndarray: 2D координаты t-SNE
+        """
+        print("Вычисление t-SNE...")
+        tsne_input_dim = max(2, min(pca_dim, x.shape[1], len(self.df) - 1))
+        tsne_input = PCA(n_components=tsne_input_dim, random_state=self.random_state).fit_transform(x)
+
+        perplexity = min(30, max(10, len(self.df) // 25))
+
+        tsne = TSNE(
+            n_components=2,
+            perplexity=perplexity,
+            learning_rate="auto",
+            init="pca",
+            metric="cosine",
+            max_iter=1500,
+            random_state=self.random_state,
+        )
+        z_tsne = tsne.fit_transform(tsne_input)
+        return z_tsne
+
+    def save_results(self, output_dir: Path, labels: np.ndarray, z_tsne: np.ndarray,
+                     best_k: int, model_name: str, text_view: str):
+        """
+        Сохраняет результаты кластеризации.
+
+        Args:
+            output_dir (Path): Директория для сохранения
+            labels (np.ndarray): Метки кластеров
+            z_tsne (np.ndarray): Координаты t-SNE
+            best_k (int): Оптимальное количество кластеров
+            model_name (str): Название модели
+            text_view (str): Представление текста
+        """
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Добавляем результаты в DataFrame
+        df_out = self.df.copy()
+        df_out["cluster"] = labels.astype(int)
+        df_out["best_model"] = model_name
+        df_out["best_text_view"] = text_view
+        df_out["best_k"] = best_k
+        df_out["tsne_x"] = z_tsne[:, 0]
+        df_out["tsne_y"] = z_tsne[:, 1]
+
+        # Сохраняем CSV
+        df_out.to_csv(output_dir / "articles_with_clusters.csv", index=False, encoding="utf-8-sig")
+        print(f"Результаты сохранены: {output_dir / 'articles_with_clusters.csv'}")
+
+        # Матрица кластер-тема
+        cluster_topic_matrix = pd.crosstab(df_out["cluster"], df_out["topic"])
+        cluster_topic_matrix.to_csv(output_dir / "cluster_topic_matrix.csv", encoding="utf-8-sig")
+
+        return df_out
+
+
+def run_clustering(df: pd.DataFrame, min_k: int = 5, max_k: int = 50,
+                   output_dir: str = None, random_state: int = 42):
+    """
+    Автоматический подбор лучшей модели и представления текста для кластеризации.
+
+    Args:
+        df (pd.DataFrame): DataFrame с данными
+        min_k (int): Минимальное количество кластеров
+        max_k (int): Максимальное количество кластеров
+        output_dir (str): Директория для сохранения результатов
+        random_state (int): Random state
+
+    Returns:
+        tuple: (clusterer, df_with_clusters, best_k, best_model, best_text_view)
+    """
+    t0 = time.perf_counter()
+
+    # Модели для тестирования (убрали LaBSE)
+    models = [
+        "cointegrated/rubert-tiny2",
+        "mlsa-iai-msu-lab/sci-rus-tiny",
+    ]
+
+    # Представления текста
+    text_views = ["title_ann_kw", "title_ann_kw_mt", "title_ann_kw_ct"]
+
+    print("=" * 80)
+    print("АВТОМАТИЧЕСКИЙ ПОДБОР ЛУЧШЕЙ МОДЕЛИ И ПРЕДСТАВЛЕНИЯ")
+    print("=" * 80)
+    print(f"\nМодели для тестирования:")
+    for i, model in enumerate(models, 1):
+        print(f"  {i}. {model}")
+
+    print(f"\nПредставления текста:")
+    for i, view in enumerate(text_views, 1):
+        print(f"  {i}. {view}")
+
+    print(f"\nДиапазон кластеров: {min_k}-{max_k}")
+    print("=" * 80)
+
+    # Инициализация
+    clusterer = EmbeddingClusterer(df, random_state=random_state)
+    clusterer.prepare_data()
+
+    best_overall_silhouette = -1
+    best_model = None
+    best_text_view = None
+    best_k = None
+    best_x = None
+    best_labels = None
+    best_metrics_df = None
+
+    # Перебор всех комбинаций
+    for model_name in models:
+        for text_view in text_views:
+            print(f"\n{'=' * 80}")
+            print(f"Тестирование: {model_name} | {text_view}")
+            print(f"{'=' * 80}")
+
+            try:
+                # Создание эмбеддингов
+                x = clusterer.encode_with_model(model_name, text_view)
+
+                # Поиск оптимального k
+                print("\nПоиск оптимального количества кластеров...")
+                metrics_df = clusterer.find_optimal_k(x, min_k=min_k, max_k=max_k)
+
+                # Выбор лучшего k для этой комбинации
+                best_row = metrics_df.sort_values("silhouette", ascending=False).iloc[0]
+                k = int(best_row["k"])
+                silhouette = float(best_row["silhouette"])
+
+                print(f"\nРезультат: k={k}, silhouette={silhouette:.4f}")
+
+                # Обновляем лучший результат
+                if silhouette > best_overall_silhouette:
+                    best_overall_silhouette = silhouette
+                    best_model = model_name
+                    best_text_view = text_view
+                    best_k = k
+                    best_x = x
+                    best_metrics_df = metrics_df
+
+            except Exception as e:
+                print(f"⚠ Ошибка при обработке {model_name} | {text_view}: {e}")
+                continue
+
+    if best_model is None:
+        raise RuntimeError("Не удалось найти подходящую модель и представление")
+
+    print(f"\n{'=' * 80}")
+    print("ЛУЧШАЯ КОМБИНАЦИЯ")
+    print(f"{'=' * 80}")
+    print(f"Модель: {best_model}")
+    print(f"Представление: {best_text_view}")
+    print(f"Оптимальное k: {best_k}")
+    print(f"Silhouette score: {best_overall_silhouette:.4f}")
+    print(f"{'=' * 80}")
+
+    # Кластеризация с лучшими параметрами
+    best_labels = clusterer.cluster(best_x, best_k)
+
+    # t-SNE
+    z_tsne = clusterer.compute_tsne(best_x)
+
+    # Сохранение результатов
+    if output_dir:
+        output_path = Path(output_dir)
+        df_out = clusterer.save_results(output_path, best_labels, z_tsne, best_k, best_model, best_text_view)
+
+        # График t-SNE
+        plt.figure(figsize=(10, 8))
+        scatter = plt.scatter(z_tsne[:, 0], z_tsne[:, 1], c=best_labels, cmap="tab20", s=30, alpha=0.7)
+        plt.colorbar(scatter, label="Cluster")
+        plt.title(f"t-SNE визуализация кластеров (k={best_k})\n{best_model} | {best_text_view}")
+        plt.xlabel("t-SNE 1")
+        plt.ylabel("t-SNE 2")
+        plt.tight_layout()
+        plt.savefig(output_path / "tsne_clusters.png", dpi=150)
+        plt.close()
+
+        # График silhouette
+        plt.figure(figsize=(10, 5))
+        plt.plot(best_metrics_df["k"], best_metrics_df["silhouette"], marker="o")
+        plt.axvline(best_k, linestyle="--", color="red", alpha=0.7, label=f"best k={best_k}")
+        plt.xlabel("Количество кластеров (k)")
+        plt.ylabel("Silhouette Score")
+        plt.title(f"Подбор оптимального числа кластеров\n{best_model} | {best_text_view}")
+        plt.legend()
+        plt.grid(alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(output_path / "silhouette_curve.png", dpi=150)
+        plt.close()
+
+        # Дополнительные визуализации для k = 5, 10, 15, 20
+        k_values_viz = [5, 10, 15, 20]
+        for k_viz in k_values_viz:
+            # Кластеризация с заданным k
+            kmeans_viz = KMeans(n_clusters=k_viz, random_state=random_state, n_init=20)
+            labels_viz = kmeans_viz.fit_predict(best_x)
+            sil_avg = silhouette_score(
+                best_x, labels_viz, metric="cosine",
+                sample_size=min(500, len(best_x)), random_state=random_state,
+            )
+            print(f"Для k={k_viz}, средний силуэт: {sil_avg:.4f}")
+
+            # Силуэтный график
+            sil_vals = silhouette_samples(best_x, labels_viz, metric="cosine")
+            y_lower = 10
+            plt.figure(figsize=(8, 6))
+            for i in range(k_viz):
+                ith_sil = sil_vals[labels_viz == i]
+                ith_sil.sort()
+                size_i = ith_sil.shape[0]
+                y_upper = y_lower + size_i
+                color = plt.get_cmap('tab20')(i / k_viz)
+                plt.fill_betweenx(
+                    np.arange(y_lower, y_upper), 0, ith_sil,
+                    facecolor=color, edgecolor=color, alpha=0.7,
+                )
+                plt.text(-0.05, y_lower + 0.5 * size_i, str(i))
+                y_lower = y_upper + 10
+            plt.axvline(x=sil_avg, color="red", linestyle="--")
+            plt.title(f"Силуэтный график (k={k_viz})")
+            plt.xlabel("Силуэтный коэффициент")
+            plt.ylabel("Кластер")
+            plt.yticks([])
+            plt.tight_layout()
+            plt.savefig(output_path / f"silhouette_viz_k{k_viz}.png", dpi=200)
+            plt.close()
+
+            # t-SNE (используем уже вычисленный z_tsne)
+            plt.figure(figsize=(8, 6))
+            plt.scatter(
+                z_tsne[:, 0], z_tsne[:, 1], c=labels_viz, cmap="tab20",
+                s=28, alpha=0.86, linewidths=0.2, edgecolors="white",
+            )
+            plt.title(f"t-SNE визуализация (k={k_viz})")
+            plt.xlabel("t-SNE 1")
+            plt.ylabel("t-SNE 2")
+            plt.colorbar(label="cluster")
+            plt.tight_layout()
+            plt.savefig(output_path / f"tsne_viz_k{k_viz}.png", dpi=200)
+            plt.close()
+
+            # Размеры кластеров
+            cluster_sizes = df_out["cluster"].value_counts().sort_index()
+            plt.figure(figsize=(10, 4))
+            plt.bar(cluster_sizes.index.astype(str), cluster_sizes.values)
+            plt.title(f"Размеры кластеров (k={best_k})")
+            plt.xlabel("cluster")
+            plt.ylabel("articles")
+            plt.grid(axis="y", alpha=0.25)
+            plt.tight_layout()
+            plt.savefig(output_path / "best_setup_cluster_sizes.png", dpi=220)
+            plt.close()
+
+        print(f"\nГрафики сохранены в: {output_path}")
+    else:
+        df_out = clusterer.df.copy()
+        df_out["cluster"] = best_labels
+        df_out["best_model"] = best_model
+        df_out["best_text_view"] = best_text_view
+        df_out["best_k"] = best_k
+
+    print(f"\nВремя выполнения: {time.perf_counter() - t0:.2f} сек")
+
+    return clusterer, df_out, best_k, best_model, best_text_view
+
+
+if __name__ == "__main__":
+    # Пример использования
+    df = pd.read_csv("project_data/dataset_IMT.csv")
+
+    clusterer, df_clustered, best_k, best_model, best_text_view = run_clustering(
+        df,
+        min_k=5,
+        max_k=50,
+        output_dir="project_data/clustering_results"
+    )
+
+    print(f"\nКластеризация завершена:")
+    print(f" Модель: {best_model}")
+    print(f" Представление: {best_text_view}")
+    print(f" Количество кластеров: {best_k}")
