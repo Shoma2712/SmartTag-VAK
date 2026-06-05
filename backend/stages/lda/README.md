@@ -209,16 +209,17 @@
 
 ---
 
-### Функция `run_lda_modeling(df, tokens_column='lda_tokens', start_topics=4, limit_topics=20, output_dir=None)`
+### Функция `run_lda_modeling(df, tokens_column='lda_tokens', start_topics=4, limit_topics=20, conn=None, output_dir=None)`
 
-Упрощенная функция для запуска LDA моделирования.
+Упрощенная функция для запуска LDA моделирования с сохранением в базу данных.
 
 **Параметры:**
 - `df` (pd.DataFrame): DataFrame с данными
 - `tokens_column` (str): Название колонки с токенами
 - `start_topics` (int): Начальное количество тем
 - `limit_topics` (int): Максимальное количество тем
-- `output_dir` (str, optional): Директория для сохранения результатов
+- `conn`: Соединение с базой данных SQLite (опционально)
+- `output_dir` (str, optional): Директория для сохранения графиков
 
 **Возвращает:**
 - Обученная модель `LDATopicModeler`
@@ -230,16 +231,20 @@
 4. Выводит темы
 5. Строит графики (coherence и облака слов)
 6. Сохраняет графики (если указан `output_dir`)
+7. Сохраняет результаты в таблицу `lda_results` (если передан `conn`)
 
 **Пример использования:**
 ```python
 from backend.stages.lda import run_lda_modeling
+from backend.database import get_connection
 
+conn = get_connection("project_data/smarttag_vak.db")
 modeler = run_lda_modeling(
     df,
     tokens_column='lda_tokens',
     start_topics=4,
     limit_topics=20,
+    conn=conn,
     output_dir="project_data/lda_results"
 )
 
@@ -248,7 +253,24 @@ print(modeler.get_model_info())
 
 ---
 
-## Структура выходных файлов
+## Структура выходных данных
+
+### База данных SQLite
+
+Результаты LDA сохраняются в таблицу **`lda_results`** базы данных `project_data/smarttag_vak.db`:
+
+**Структура таблицы `lda_results`:**
+```sql
+CREATE TABLE lda_results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    article_id INTEGER NOT NULL,
+    lda_tokens TEXT,              -- Токены для LDA
+    lda_topic_keywords TEXT,      -- Ключевые слова темы
+    FOREIGN KEY (article_id) REFERENCES articles(id) ON DELETE CASCADE
+)
+```
+
+### Графики
 
 ```
 project_data/
@@ -261,22 +283,30 @@ project_data/
 
 ## Запуск
 
-Блок можно запустить как отдельный модуль:
+Блок можно запустить через пайплайн:
 
-```bash
-python blocks/block_4_lda/lda_modeling.py
+```python
+from backend.pipeline import run_pipeline
+
+# LDA выполняется автоматически на этапе 4
+run_pipeline(db_path="project_data/smarttag_vak.db")
 ```
 
 Или импортировать в другой код:
 
 ```python
 from backend.stages.lda import run_lda_modeling
+from backend.database import get_connection, get_all_articles
+
+conn = get_connection("project_data/smarttag_vak.db")
+df = get_all_articles(conn)
 
 modeler = run_lda_modeling(
     df,
     tokens_column='lda_tokens',
     start_topics=4,
     limit_topics=20,
+    conn=conn,
     output_dir="project_data/lda_results"
 )
 ```

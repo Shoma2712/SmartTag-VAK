@@ -15,7 +15,7 @@ class IMTScraper:
         """
         Инициализация скрейпера.
 
-        Args:
+        Аргументы:
             pdf_dir (str): Путь к директории для сохранения PDF файлов
         """
         self.base_url = "https://imt-journal.ru"
@@ -30,10 +30,10 @@ class IMTScraper:
         """
         Скачивает PDF файл по указанному URL.
 
-        Args:
+        Аргументы:
             pdf_url (str): URL PDF файла
 
-        Returns:
+        Возвращает:
             bool: True если файл скачан, False если уже существует или произошла ошибка
         """
         filename = os.path.join(self.pdf_dir, pdf_url.split("/")[-1])
@@ -61,10 +61,10 @@ class IMTScraper:
         """
         Извлекает все ссылки на PDF файлы со страницы.
 
-        Args:
+        Аргументы:
             page_url (str): URL страницы для парсинга
 
-        Returns:
+        Возвращает:
             list: Список URL-ов PDF файлов
         """
         pdf_urls = []
@@ -88,10 +88,10 @@ class IMTScraper:
         """
         Находит ссылку на следующую страницу пагинации.
 
-        Args:
+        Аргументы:
             current_page_url (str): URL текущей страницы
 
-        Returns:
+        Возвращает:
             str: URL следующей страницы или None если следующей страницы нет
         """
         try:
@@ -126,11 +126,11 @@ class IMTScraper:
         """
         Запускает процесс сбора PDF файлов.
 
-        Args:
+        Аргументы:
             max_pages (int): Максимальное количество страниц для обхода
             delay (float): Задержка между запросами в секундах
 
-        Returns:
+        Возвращает:
             dict: Статистика сбора (количество страниц, скачанных файлов)
         """
         print("=" * 80)
@@ -182,11 +182,11 @@ def run_scraper(pdf_dir: str, max_pages: int = 50):
     """
     Удобная функция для запуска скрейпера.
 
-    Args:
+    Аргументы:
         pdf_dir (str): Путь к директории для сохранения PDF
         max_pages (int): Максимальное количество страниц
 
-    Returns:
+    Возвращает:
         dict: Статистика сбора
     """
     scraper = IMTScraper(pdf_dir)

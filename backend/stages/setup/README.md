@@ -106,8 +106,10 @@ paths = initialize_project()
 ```
 project_data/
 ├── pdfs/
-│   └── imt/              # PDF файлы журнала IMT
-└── dataset_IMT.csv       # Парсированные данные (создается позже)
+│   └── imt/                  # PDF файлы журнала IMT
+├── lda_results/              # Графики LDA (создается позже)
+├── clustering_results/       # Графики кластеризации (создается позже)
+└── smarttag_vak.db          # База данных SQLite (создается позже)
 ```
 
 ---

@@ -295,9 +295,16 @@ UDCParser.parse_udc("N/A")            # "N/A"
 
 ---
 
-##### `parse_folder(pdf_folder: Path, output_csv: Path) -> pd.DataFrame`
+##### `parse_folder(pdf_folder: Path, conn) -> pd.DataFrame`
 
-Парсит все PDF файлы в папке и сохраняет результат в CSV.
+Парсит все PDF файлы в папке и сохраняет результат в базу данных.
+
+**Параметры:**
+- `pdf_folder` (Path): Путь к папке с PDF файлами
+- `conn`: Соединение с базой данных SQLite
+
+**Возвращает:**
+- `pd.DataFrame`: DataFrame с парсированными статьями
 
 **Что делает:**
 1. Находит все PDF файлы в папке
@@ -307,27 +314,31 @@ UDCParser.parse_udc("N/A")            # "N/A"
    - Парсит статьи
    - Сопоставляет с темами из содержания
 3. Объединяет все статьи в DataFrame
-4. Удаляет служебные колонки
-5. Сохраняет в CSV
+4. Сохраняет статьи в таблицу `articles` базы данных через `insert_articles_batch()`
+5. Пропускает дубликаты (статьи с одинаковым заголовком)
 
 **Пример вывода:**
 ```
 Parsing IMT PDFs: 100%|████████| 45/45 [05:30<00:00, 7.33s/it]
 ✓ Парсинг завершен: 312 статей
-✓ Сохранено в: project_data/dataset_IMT.csv
+⚠️  Пропущено дубликатов: 5
+✓ Сохранено в БД: 307 статей
 ✓ Уникальных УДК: 28
 ✓ Уникальных тем: 15
 ```
 
 ---
 
-### Функция `parse_imt_folder(pdf_folder: str, output_csv: str) -> pd.DataFrame`
+### Функция `parse_imt_folder(pdf_folder: str, db_path: str) -> pd.DataFrame`
 
-Удобная функция для парсинга папки с PDF.
+Удобная функция для парсинга папки с PDF и сохранения в базу данных.
 
 **Параметры:**
 - `pdf_folder` (str): Путь к папке с PDF
-- `output_csv` (str): Путь для сохранения CSV
+- `db_path` (str): Путь к базе данных SQLite
+
+**Возвращает:**
+- `pd.DataFrame`: DataFrame с парсированными статьями
 
 **Пример использования:**
 ```python
@@ -335,7 +346,7 @@ from backend.stages.parser import parse_imt_folder
 
 df = parse_imt_folder(
     pdf_folder="project_data/pdfs/imt",
-    output_csv="project_data/dataset_IMT.csv"
+    db_path="project_data/smarttag_vak.db"
 )
 print(f"Спарсено статей: {len(df)}")
 ```
@@ -354,30 +365,54 @@ project_data/
         └── ...
 ```
 
-### Выходные данные (CSV)
-```csv
-source,udc,title,authors,annotation,keywords,main_text,lda_tokens,clean_text,full_text,topic
-journal_1.pdf,004,"Заголовок статьи","Иванов И.И., Петров П.П.","Аннотация...","ключевые, слова","Основной текст...","[токены]","Чистый текст...","Полный текст...","Информационные технологии"
+### Выходные данные (База данных SQLite)
+
+Результаты парсинга сохраняются в таблицу **`articles`** базы данных `project_data/smarttag_vak.db`:
+
+**Структура таблицы `articles`:**
+```sql
+CREATE TABLE articles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT,                -- Имя PDF файла
+    title TEXT NOT NULL UNIQUE, -- Заголовок статьи
+    annotation TEXT,            -- Аннотация
+    keywords TEXT,              -- Ключевые слова
+    main_text TEXT,             -- Основной текст
+    udc TEXT,                   -- УДК код
+    authors TEXT,               -- Авторы
+    lda_tokens TEXT,            -- Токены для LDA (строковое представление списка)
+    topic TEXT                  -- Тема из содержания PDF
+)
 ```
+
+**Пример записи:**
+| id | source | title | authors | annotation | keywords | main_text | udc | lda_tokens | topic |
+|----|--------|-------|---------|------------|----------|-----------|-----|------------|-------|
+| 1 | journal_1.pdf | Заголовок статьи | Иванов И.И., Петров П.П. | Аннотация... | ключевые, слова | Основной текст... | 004 | ['токен1', 'токен2', ...] | Информационные технологии |
 
 ---
 
 ## Запуск
 
-Блок можно запустить как отдельный модуль:
+Блок можно запустить через пайплайн:
 
-```bash
-python blocks/block_3_parser/parser_part3.py
+```python
+from backend.pipeline import run_pipeline
+
+# Парсинг выполняется автоматически на этапе 3
+run_pipeline(db_path="project_data/smarttag_vak.db")
 ```
 
 Или импортировать в другой код:
 
 ```python
 from backend.stages.parser import parse_imt_folder
+from backend.database import get_connection
 
+conn = get_connection("project_data/smarttag_vak.db")
 df = parse_imt_folder(
     pdf_folder="project_data/pdfs/imt",
-    output_csv="project_data/dataset_IMT.csv"
+    db_path="project_data/smarttag_vak.db"
 )
 ```
 

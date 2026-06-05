@@ -12,6 +12,13 @@ from sklearn.preprocessing import normalize
 import warnings
 import logging
 import os
+import sqlite3
+
+# Импорт database functions
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+from database import get_articles_with_lda, insert_clustering_results_batch, get_connection
+from config import DEFAULT_DATABASE_PATH
 
 warnings.filterwarnings("ignore")
 logging.getLogger("transformers").setLevel(logging.ERROR)
@@ -24,10 +31,10 @@ def normalize_text(s: str) -> str:
     """
     Нормализация текста.
 
-    Args:
+    Аргументы:
         s (str): Исходный текст
 
-    Returns:
+    Возвращает:
         str: Нормализованный текст
     """
     return " ".join(str(s or "").replace("\xa0", " ").split())
@@ -37,17 +44,20 @@ def build_text_views(row: pd.Series) -> dict:
     """
     Строит различные представления текста для эмбеддингов.
 
-    Args:
+    Аргументы:
         row (pd.Series): Строка DataFrame
 
-    Returns:
+    Возвращает:
         dict: Словарь с представлениями текста
     """
     title = normalize_text(row.get("title", ""))
     ann = normalize_text(row.get("annotation", ""))
     kw = normalize_text(row.get("keywords", ""))
     mt = normalize_text(row.get("main_text", ""))
-    ct = normalize_text(row.get("clean_text", ""))
+    
+    # Использование lda_tokens как clean_text если колонка clean_text отсутствует
+    ct = normalize_text(row.get("clean_text", row.get("lda_tokens", "")))
+    
     view_title_ann_kw = normalize_text(f"{title}. {ann}. {kw}.")
 
     MAX_CHARS = 9000
@@ -64,11 +74,11 @@ def load_embedding_model(model_name: str, allow_download: bool = True):
     """
     Загружает модель для создания эмбеддингов.
 
-    Args:
+    Аргументы:
         model_name (str): Название модели
         allow_download (bool): Разрешить загрузку модели
 
-    Returns:
+    Возвращает:
         tuple: (модель, описание_источника)
     """
     from sentence_transformers import SentenceTransformer
@@ -86,12 +96,12 @@ def encode_texts(model, texts: list, batch_size: int = 32) -> np.ndarray:
     """
     Создает эмбеддинги для текстов.
 
-    Args:
+    Аргументы:
         model: Модель sentence-transformers
         texts (list): Список текстов
         batch_size (int): Размер батча
 
-    Returns:
+    Возвращает:
         np.ndarray: Матрица эмбеддингов
     """
     x = model.encode(
@@ -109,13 +119,13 @@ def evaluate_k_range(x: np.ndarray, k_values: list, sample_size: int = 500, rand
     """
     Оценивает качество кластеризации для разных значений k.
 
-    Args:
+    Аргументы:
         x (np.ndarray): Матрица эмбеддингов
         k_values (list): Список значений k для проверки
         sample_size (int): Размер выборки для silhouette
         random_state (int): Random state
 
-    Returns:
+    Возвращает:
         pd.DataFrame: DataFrame с метриками для каждого k
     """
     rows = []
@@ -147,7 +157,7 @@ class EmbeddingClusterer:
         """
         Инициализация кластеризатора.
 
-        Args:
+        Аргументы:
             df (pd.DataFrame): DataFrame с данными
             random_state (int): Random state для воспроизводимости
         """
@@ -159,7 +169,7 @@ class EmbeddingClusterer:
         """
         Подготовка данных для кластеризации.
 
-        Args:
+        Аргументы:
             text_views (dict): Словарь с описаниями представлений текста
         """
         if text_views is None:
@@ -170,6 +180,10 @@ class EmbeddingClusterer:
             }
 
         self.text_views = text_views
+
+        # Переименование lda_topic to topic for backward compatibility
+        if 'lda_topic' in self.df.columns and 'topic' not in self.df.columns:
+            self.df['topic'] = self.df['lda_topic']
 
         # Строим представления текста
         print("Построение представлений текста...")
@@ -206,12 +220,12 @@ class EmbeddingClusterer:
         """
         Создает эмбеддинги для текстов с помощью модели.
 
-        Args:
+        Аргументы:
             model_name (str): Название модели
             text_view (str): Представление текста
             batch_size (int): Размер батча
 
-        Returns:
+        Возвращает:
             np.ndarray: Матрица эмбеддингов
         """
         cache_key = (model_name, text_view)
@@ -232,13 +246,13 @@ class EmbeddingClusterer:
         """
         Находит оптимальное количество кластеров.
 
-        Args:
+        Аргументы:
             x (np.ndarray): Матрица эмбеддингов
             min_k (int): Минимальное количество кластеров
             max_k (int): Максимальное количество кластеров
             sample_size (int): Размер выборки для silhouette
 
-        Returns:
+        Возвращает:
             pd.DataFrame: DataFrame с метриками
         """
         n = len(x)
@@ -255,11 +269,11 @@ class EmbeddingClusterer:
         """
         Выполняет кластеризацию.
 
-        Args:
+        Аргументы:
             x (np.ndarray): Матрица эмбеддингов
             k (int): Количество кластеров
 
-        Returns:
+        Возвращает:
             np.ndarray: Метки кластеров
         """
         print(f"Кластеризация с k={k}...")
@@ -270,11 +284,11 @@ class EmbeddingClusterer:
         """
         Вычисляет t-SNE для визуализации.
 
-        Args:
+        Аргументы:
             x (np.ndarray): Матрица эмбеддингов
             pca_dim (int): Размерность PCA перед t-SNE
 
-        Returns:
+        Возвращает:
             np.ndarray: 2D координаты t-SNE
         """
         print("Вычисление t-SNE...")
@@ -295,18 +309,24 @@ class EmbeddingClusterer:
         z_tsne = tsne.fit_transform(tsne_input)
         return z_tsne
 
-    def save_results(self, output_dir: Path, labels: np.ndarray, z_tsne: np.ndarray,
+    def save_results(self, conn: sqlite3.Connection, output_dir: Path, labels: np.ndarray, z_tsne: np.ndarray,
                      best_k: int, model_name: str, text_view: str):
         """
-        Сохраняет результаты кластеризации.
+        Сохраняет результаты кластеризации в базу данных.
+        
+        Использует insert_clustering_results_batch() для сохранения результатов кластеризации.
 
-        Args:
-            output_dir (Path): Директория для сохранения
+        Аргументы:
+            conn (sqlite3.Connection): Соединение с базой данных (обязательный параметр)
+            output_dir (Path): Директория для сохранения визуализаций
             labels (np.ndarray): Метки кластеров
             z_tsne (np.ndarray): Координаты t-SNE
             best_k (int): Оптимальное количество кластеров
             model_name (str): Название модели
             text_view (str): Представление текста
+            
+        Возвращает:
+            pd.DataFrame: DataFrame с результатами кластеризации
         """
         output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -319,38 +339,114 @@ class EmbeddingClusterer:
         df_out["tsne_x"] = z_tsne[:, 0]
         df_out["tsne_y"] = z_tsne[:, 1]
 
-        # Сохраняем CSV
-        df_out.to_csv(output_dir / "articles_with_clusters.csv", index=False, encoding="utf-8-sig")
-        print(f"Результаты сохранены: {output_dir / 'articles_with_clusters.csv'}")
+        # Создаём маппинг cluster -> cluster_name на основе распределения тем
+        TOPIC_NO_CONTENTS = "Тема не указана в содержании"
+        TOPIC_UNDEFINED = "Тема не определена"
+        
+        cluster_topic_dist = {}
+        for cluster_id in df_out['cluster'].unique():
+            mask = df_out['cluster'] == cluster_id
+            topics = df_out.loc[mask, 'topic'].dropna()
+            
+            # Фильтруем неопределенные темы
+            topics_filtered = topics[~topics.isin([TOPIC_NO_CONTENTS, TOPIC_UNDEFINED])]
+            
+            if len(topics_filtered) > 0:
+                # Вычисляем долю каждой темы в кластере
+                topic_counts = topics_filtered.value_counts(normalize=True)
+                cluster_topic_dist[cluster_id] = topic_counts
+            else:
+                cluster_topic_dist[cluster_id] = pd.Series(dtype=float)
+        
+        # Создаем список всех тем с их максимальной долей в кластерах
+        topic_max_cluster = {}  # тема -> (кластер, доля)
+        
+        for cluster_id, topic_dist in cluster_topic_dist.items():
+            for topic, proportion in topic_dist.items():
+                if topic not in topic_max_cluster or proportion > topic_max_cluster[topic][1]:
+                    topic_max_cluster[topic] = (cluster_id, proportion)
+        
+        # Присваиваем темы кластерам (тема идет к кластеру, где она наиболее выражена)
+        cluster_topic_map = {}
+        used_topics = set()
+        
+        # Сортируем темы по убыванию максимальной доли
+        sorted_topics = sorted(topic_max_cluster.items(), key=lambda x: x[1][1], reverse=True)
+        
+        for topic, (best_cluster, proportion) in sorted_topics:
+            if best_cluster not in cluster_topic_map and topic not in used_topics:
+                cluster_topic_map[best_cluster] = topic
+                used_topics.add(topic)
+                print(f"  Кластер {best_cluster} → {topic} ({proportion:.1%})")
+        
+        # Для кластеров без темы присваиваем следующую доступную тему
+        for cluster_id in sorted(df_out['cluster'].unique()):
+            if cluster_id not in cluster_topic_map:
+                topic_dist = cluster_topic_dist.get(cluster_id, pd.Series(dtype=float))
+                
+                # Ищем первую неиспользованную тему
+                assigned = None
+                for topic in topic_dist.index:
+                    if topic not in used_topics:
+                        assigned = topic
+                        break
+                
+                if assigned is None:
+                    # Если все темы использованы, берем самую частую (даже если дубликат)
+                    if len(topic_dist) > 0:
+                        assigned = topic_dist.index[0]
+                    else:
+                        assigned = f"Кластер {cluster_id}"
+                
+                cluster_topic_map[cluster_id] = assigned
+                used_topics.add(assigned)
+                print(f"  Кластер {cluster_id} → {assigned} (резервная)")
+        
+        # Добавляем cluster_name в DataFrame
+        df_out['cluster_name'] = df_out['cluster'].map(cluster_topic_map)
 
-        # Матрица кластер-тема
-        cluster_topic_matrix = pd.crosstab(df_out["cluster"], df_out["topic"])
-        cluster_topic_matrix.to_csv(output_dir / "cluster_topic_matrix.csv", encoding="utf-8-sig")
+        # Сохраняем результаты кластеризации в базу данных
+        clustering_results = []
+        for _, row in df_out.iterrows():
+            clustering_results.append({
+                'article_id': int(row['id']),
+                'cluster_name': str(row['cluster_name'])
+            })
+        
+        rowcount = insert_clustering_results_batch(conn, clustering_results)
+        print(f"Сохранено {rowcount} результатов кластеризации в базу данных")
 
         return df_out
 
 
-def run_clustering(df: pd.DataFrame, min_k: int = 5, max_k: int = 50,
+def run_clustering(conn: sqlite3.Connection, min_k: int = 5, max_k: int = 50,
                    output_dir: str = None, random_state: int = 42):
     """
     Автоматический подбор лучшей модели и представления текста для кластеризации.
+    Читает данные из базы данных через get_articles_with_lda() и сохраняет 
+    результаты обратно в БД через insert_clustering_results_batch() и 
+    insert_cluster_topic_matrix().
 
-    Args:
-        df (pd.DataFrame): DataFrame с данными
-        min_k (int): Минимальное количество кластеров
-        max_k (int): Максимальное количество кластеров
-        output_dir (str): Директория для сохранения результатов
-        random_state (int): Random state
+    Аргументы:
+        conn (sqlite3.Connection): Соединение с базой данных (обязательный параметр)
+        min_k (int): Минимальное количество кластеров (по умолчанию 5)
+        max_k (int): Максимальное количество кластеров (по умолчанию 50)
+        output_dir (str): Директория для сохранения визуализаций (опционально)
+        random_state (int): Random state для воспроизводимости (по умолчанию 42)
 
-    Returns:
+    Возвращает:
         tuple: (clusterer, df_with_clusters, best_k, best_model, best_text_view)
     """
     t0 = time.perf_counter()
 
-    # Модели для тестирования (убрали LaBSE)
+    # Загружаем данные из базы данных
+    print("Загрузка данных из базы данных...")
+    df = get_articles_with_lda(conn)
+    print(f"Загружено {len(df)} статей из базы данных")
+
+    # Модели для тестирования
     models = [
-        "cointegrated/rubert-tiny2",
-        "mlsa-iai-msu-lab/sci-rus-tiny",
+        "mlsa-iai-msu-lab/sci-rus-tiny"
     ]
 
     # Представления текста
@@ -438,7 +534,7 @@ def run_clustering(df: pd.DataFrame, min_k: int = 5, max_k: int = 50,
     # Сохранение результатов
     if output_dir:
         output_path = Path(output_dir)
-        df_out = clusterer.save_results(output_path, best_labels, z_tsne, best_k, best_model, best_text_view)
+        df_out = clusterer.save_results(conn, output_path, best_labels, z_tsne, best_k, best_model, best_text_view)
 
         # График t-SNE
         plt.figure(figsize=(10, 8))
@@ -542,16 +638,19 @@ def run_clustering(df: pd.DataFrame, min_k: int = 5, max_k: int = 50,
 
 if __name__ == "__main__":
     # Пример использования
-    df = pd.read_csv("project_data/dataset_IMT.csv")
+    conn = get_connection(DEFAULT_DATABASE_PATH)
+    
+    try:
+        clusterer, df_clustered, best_k, best_model, best_text_view = run_clustering(
+            conn,
+            min_k=5,
+            max_k=50,
+            output_dir="project_data/clustering_results"
+        )
 
-    clusterer, df_clustered, best_k, best_model, best_text_view = run_clustering(
-        df,
-        min_k=5,
-        max_k=50,
-        output_dir="project_data/clustering_results"
-    )
-
-    print(f"\nКластеризация завершена:")
-    print(f" Модель: {best_model}")
-    print(f" Представление: {best_text_view}")
-    print(f" Количество кластеров: {best_k}")
+        print(f"\nКластеризация завершена:")
+        print(f" Модель: {best_model}")
+        print(f" Представление: {best_text_view}")
+        print(f" Количество кластеров: {best_k}")
+    finally:
+        conn.close()

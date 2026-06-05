@@ -212,26 +212,37 @@
 
 ---
 
-### `save_results(output_dir: Path, labels: np.ndarray, z_tsne: np.ndarray, best_k: int, model_name: str, text_view: str)`
+### `save_results(output_dir: Path, labels: np.ndarray, z_tsne: np.ndarray, best_k: int, model_name: str, text_view: str, conn=None)`
 
-Сохраняет результаты кластеризации.
+Сохраняет результаты кластеризации в базу данных и файлы.
+
+**Параметры:**
+- `output_dir` (Path): Директория для сохранения файлов
+- `labels` (np.ndarray): Метки кластеров
+- `z_tsne` (np.ndarray): 2D координаты t-SNE
+- `best_k` (int): Количество кластеров
+- `model_name` (str): Название модели эмбеддингов
+- `text_view` (str): Представление текста
+- `conn`: Соединение с базой данных SQLite (опционально)
 
 **Что делает:**
 1. Добавляет метки кластеров и параметры в DataFrame
-2. Сохраняет CSV с результатами (`articles_with_clusters.csv`)
-3. Строит матрицу «кластер-тема» (`cluster_topic_matrix.csv`)
+2. Сохраняет результаты в таблицу `clustering_results` (если передан `conn`)
+3. Сохраняет CSV с результатами (`articles_with_clusters.csv`)
+4. Строит матрицу «кластер-тема» (`cluster_topic_matrix.csv`)
 
 ---
 
-### Функция `run_clustering(df: pd.DataFrame, min_k: int = 6, max_k: int = 35, output_dir: str = None, random_state: int = 42) -> tuple`
+### Функция `run_clustering(df: pd.DataFrame, min_k: int = 6, max_k: int = 35, output_dir: str = None, conn=None, random_state: int = 42) -> tuple`
 
-Автоматический подбор лучшей модели и представления текста для кластеризации.
+Автоматический подбор лучшей модели и представления текста для кластеризации с сохранением в базу данных.
 
 **Параметры:**
 - `df` (pd.DataFrame): DataFrame с данными
 - `min_k` (int): Минимальное количество кластеров
 - `max_k` (int): Максимальное количество кластеров
 - `output_dir` (str): Директория для сохранения результатов
+- `conn`: Соединение с базой данных SQLite (опционально)
 - `random_state` (int): Random state
 
 **Возвращает:**
@@ -250,54 +261,55 @@
 4. Выбирает лучшую комбинацию
 5. Выполняет кластеризацию с лучшими параметрами
 6. Вычисляет t-SNE
-7. Сохраняет результаты и графики
+7. Сохраняет результаты в базу данных (если передан `conn`)
+8. Сохраняет графики
 
-**Пример вывода:**
-```
-================================================================================
-АВТОМАТИЧЕСКИЙ ПОДБОР ЛУЧШЕЙ МОДЕЛИ И ПРЕДСТАВЛЕНИЯ
-================================================================================
+**Пример использования:**
+```python
+from backend.stages.clustering import run_clustering
+from backend.database import get_connection, get_all_articles
 
-Модели для тестирования:
-  1. cointegrated/rubert-tiny2
-  2. mlsa-iai-msu-lab/sci-rus-tiny
+conn = get_connection("project_data/smarttag_vak.db")
+df = get_all_articles(conn)
 
-Представления текста:
-  1. title_ann_kw
-  2. full_text
+clusterer, df_clustered, best_k, best_model, best_text_view = run_clustering(
+    df,
+    min_k=6,
+    max_k=35,
+    output_dir="project_data/clustering_results",
+    conn=conn
+)
 
-================================================================================
-Тестирование: cointegrated/rubert-tiny2 | title_ann_kw
-================================================================================
-Построение представлений текста...
-Размер датасета: 300 | уникальные темы: 15
-Создание эмбеддингов: cointegrated/rubert-tiny2 | title_ann_kw
-...
-Оценка k=6...
-Оценка k=7...
-...
-Результат: k=15, silhouette=0.4231
-
-================================================================================
-ЛУЧШАЯ КОМБИНАЦИЯ
-================================================================================
-Модель: cointegrated/rubert-tiny2
-Представление: title_ann_kw
-Оптимальное k: 15
-Silhouette score: 0.4231
-================================================================================
-
-Время выполнения: 45.23 сек
+print(f"Кластеризация завершена:")
+print(f"  Модель: {best_model}")
+print(f"  Представление: {best_text_view}")
+print(f"  Количество кластеров: {best_k}")
 ```
 
 ---
 
-## Структура выходных файлов
+## Структура выходных данных
+
+### База данных SQLite
+
+Результаты кластеризации сохраняются в таблицу **`clustering_results`** базы данных `project_data/smarttag_vak.db`:
+
+**Структура таблицы `clustering_results`:**
+```sql
+CREATE TABLE clustering_results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    article_id INTEGER NOT NULL,
+    cluster_name TEXT,            -- Название кластера
+    FOREIGN KEY (article_id) REFERENCES articles(id) ON DELETE CASCADE
+)
+```
+
+### Файлы
 
 ```
 project_data/
 └── clustering_results/
-    ├── articles_with_clusters.csv    # Статьи с кластерами
+    ├── articles_with_clusters.csv    # Статьи с кластерами (резервная копия)
     ├── cluster_topic_matrix.csv      # Матрица кластер-тема
     ├── tsne_clusters.png             # t-SNE визуализация
     └── silhouette_curve.png         # График подбора k
@@ -307,22 +319,30 @@ project_data/
 
 ## Запуск
 
-Блок можно запустить как отдельный модуль:
+Блок можно запустить через пайплайн:
 
-```bash
-python blocks/block_5_clustering/clustering.py
+```python
+from backend.pipeline import run_pipeline
+
+# Кластеризация выполняется автоматически на этапе 5
+run_pipeline(db_path="project_data/smarttag_vak.db")
 ```
 
 Или импортировать в другой код:
 
 ```python
 from backend.stages.clustering import run_clustering
+from backend.database import get_connection, get_all_articles
+
+conn = get_connection("project_data/smarttag_vak.db")
+df = get_all_articles(conn)
 
 clusterer, df_clustered, best_k, best_model, best_text_view = run_clustering(
     df,
     min_k=6,
     max_k=35,
-    output_dir="project_data/clustering_results"
+    output_dir="project_data/clustering_results",
+    conn=conn
 )
 
 print(f"Кластеризация завершена:")
@@ -349,8 +369,10 @@ print(f"  Количество кластеров: {best_k}")
 ## Примечания
 
 - Блок автоматически подбирает лучшую модель по Silhouette Score
+- **Типичные значения Silhouette Score:** 0.15-0.45 (зависит от данных и количества кластеров)
 - KMeans обучается с `n_init=20` для стабильных результатов
 - t-SNE использует предварительную PCA для ускорения
 - Эмбеддинги кэшируются: повторный запуск с той же моделью не пересчитывает их
 - Silhouette Score вычисляется на подвыборке (500 объектов) для ускорения
 - perplexity для t-SNE адаптивный (от 10 до 30)
+- Результаты сохраняются в базу данных SQLite для дальнейшего анализа

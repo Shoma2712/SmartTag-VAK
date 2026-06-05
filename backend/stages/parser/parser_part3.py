@@ -435,13 +435,13 @@ class IMTArticleParser:
 
         return rows
 
-    def parse_folder(self, pdf_folder: Path, output_csv: Path):
+    def parse_folder(self, pdf_folder: Path, db_conn=None):
         """
-        Парсит все PDF файлы в папке и сохраняет результат в CSV.
+        Парсит все PDF файлы в папке и сохраняет результат в базу данных.
 
         Args:
             pdf_folder (Path): Путь к папке с PDF файлами
-            output_csv (Path): Путь для сохранения CSV
+            db_conn: SQLite connection object (если None, возвращает DataFrame без сохранения)
 
         Returns:
             pd.DataFrame: DataFrame со всеми статьями
@@ -477,30 +477,51 @@ class IMTArticleParser:
             drop_columns = ["pdf_page", "journal", "topic_match_toc_title"]
             df = df.drop(columns=[c for c in drop_columns if c in df.columns])
 
-            # Сохраняем
-            df.to_csv(output_csv, index=False, encoding="utf-8-sig")
-
-            print(f"\n✓ Парсинг завершен: {len(df)} статей")
-            print(f"✓ Сохранено в: {output_csv}")
-            print(f"✓ Уникальных УДК: {df['udc'].nunique()}")
-            print(f"✓ Уникальных тем: {df['topic'].nunique()}")
+            # Сохраняем в базу данных если передано соединение
+            if db_conn is not None:
+                from backend.database import insert_articles_batch
+                
+                # Подготавливаем данные для вставки (только поля таблицы articles)
+                articles_list = []
+                for _, row in df.iterrows():
+                    articles_list.append({
+                        'source': row.get('source'),  # Имя PDF файла
+                        'title': row.get('title'),
+                        'annotation': row.get('annotation'),
+                        'keywords': row.get('keywords'),
+                        'main_text': row.get('main_text'),
+                        'udc': row.get('udc'),
+                        'authors': row.get('authors'),
+                        'lda_tokens': row.get('lda_tokens'),
+                        'topic': row.get('topic')
+                    })
+                
+                try:
+                    count = insert_articles_batch(db_conn, articles_list)
+                    print(f"\n✓ Парсинг завершен: {len(df)} статей")
+                    print(f"✓ Сохранено в базу данных: {count} записей")
+                    print(f"✓ Уникальных УДК: {df['udc'].nunique()}")
+                    print(f"✓ Уникальных тем: {df['topic'].nunique()}")
+                except Exception as e:
+                    print(f"❌ Ошибка при сохранении в БД: {e}")
+                    raise
 
         return df
 
 
-def parse_imt_folder(pdf_folder: str, output_csv: str):
+def parse_imt_folder(pdf_folder: str, db_conn=None):
     """
     Упрощенная функция для парсинга папки с PDF.
 
     Args:
         pdf_folder (str): Путь к папке с PDF
-        output_csv (str): Путь для сохранения CSV
+        db_conn: SQLite connection object (если None, возвращает DataFrame без сохранения)
 
     Returns:
         pd.DataFrame: DataFrame со статьями
     """
     parser = IMTArticleParser()
-    return parser.parse_folder(Path(pdf_folder), Path(output_csv))
+    return parser.parse_folder(Path(pdf_folder), db_conn)
 
 
 if __name__ == "__main__":
