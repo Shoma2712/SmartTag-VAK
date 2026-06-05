@@ -2,22 +2,27 @@
 """
 Локальный интерфейс подбора специальности ВАК (Tkinter).
 
-Запуск из корня проекта:
-    .venv\\Scripts\\python.exe vak_tkinter_app.py
-
-Ранжирование: TF-IDF (полные описания ВАК).
-Дополнительно: эмбеддинги для режима «Подробнее» и флагов расхождения.
+Ранжирование: Sentence Embeddings (семантическая близость).
+Дополнительно: TF-IDF для режима «Подробнее» и флагов расхождения.
 """
 from __future__ import annotations
 
 import sys
 import threading
 import tkinter as tk
+from pathlib import Path
 from tkinter import messagebox, scrolledtext, ttk
 from typing import Any, Dict, List, Optional, Union
 
 import pandas as pd
 
+from backend.config import DEFAULT_DATABASE_PATH
+from backend.database import (
+    get_connection, 
+    get_articles_with_vak, 
+    get_articles_with_clustering,
+    insert_saved_classification
+)
 from backend.vak_classifiers.ui_classifier import VakUiClassifier, VakUiConfig, VakUiResult
 
 MIN_TEXT_LEN = 30
@@ -37,9 +42,121 @@ class VakClassifierApp(tk.Tk):
         self._last_result: Optional[VakUiResult] = None
         self._focus_widget: Optional[TextWidget] = None
         self._input_widgets: List[TextWidget] = []
+        
+        # Database connection management
+        self._db_conn = None
+        self._db_path = DEFAULT_DATABASE_PATH
+        self._init_database_connection()
 
         self._build_ui()
         self.after(200, self._preload_model)
+        
+        # Register cleanup handler
+        self.protocol("WM_DELETE_WINDOW", self._on_closing)
+
+    def _init_database_connection(self) -> None:
+        """Initialize database connection and check if database exists."""
+        try:
+            if not Path(self._db_path).exists():
+                # Database doesn't exist yet - this is okay for manual input mode
+                # User can still manually enter article data for classification
+                self._db_conn = None
+                return
+            
+            # Connect to database
+            self._db_conn = get_connection(str(self._db_path))
+        except Exception as exc:
+            # Log error but don't prevent app from starting
+            # Manual input mode will still work
+            print(f"Warning: Could not connect to database: {exc}", file=sys.stderr)
+            self._db_conn = None
+    
+    def _on_closing(self) -> None:
+        """Clean up resources and close the application."""
+        # Close database connection if open
+        if self._db_conn is not None:
+            try:
+                self._db_conn.close()
+            except Exception as exc:
+                print(f"Error closing database connection: {exc}", file=sys.stderr)
+        
+        # Destroy the window
+        self.destroy()
+    
+    def _load_articles_from_database(self) -> Optional[pd.DataFrame]:
+        """
+        Load articles with VAK classification results from database.
+        
+        Returns:
+            DataFrame with articles and VAK results, or None if database not available
+        """
+        if self._db_conn is None:
+            if not Path(self._db_path).exists():
+                messagebox.showerror(
+                    "База данных не найдена",
+                    f"Файл базы данных не найден: {self._db_path}\n\n"
+                    "Запустите pipeline для создания базы данных или используйте "
+                    "ручной ввод для классификации статей."
+                )
+                return None
+            
+            # Try to reconnect
+            try:
+                self._db_conn = get_connection(str(self._db_path))
+            except Exception as exc:
+                messagebox.showerror(
+                    "Ошибка подключения к БД",
+                    f"Не удалось подключиться к базе данных:\n{exc}"
+                )
+                return None
+        
+        try:
+            # Load articles with VAK classification results
+            df = get_articles_with_vak(self._db_conn)
+            return df
+        except Exception as exc:
+            messagebox.showerror(
+                "Ошибка загрузки данных",
+                f"Не удалось загрузить данные из базы:\n{exc}"
+            )
+            return None
+    
+    def _load_articles_with_clustering_from_database(self) -> Optional[pd.DataFrame]:
+        """
+        Load articles with clustering results from database.
+        
+        Returns:
+            DataFrame with articles and clustering results, or None if database not available
+        """
+        if self._db_conn is None:
+            if not Path(self._db_path).exists():
+                messagebox.showerror(
+                    "База данных не найдена",
+                    f"Файл базы данных не найден: {self._db_path}\n\n"
+                    "Запустите pipeline для создания базы данных."
+                )
+                return None
+            
+            # Try to reconnect
+            try:
+                self._db_conn = get_connection(str(self._db_path))
+            except Exception as exc:
+                messagebox.showerror(
+                    "Ошибка подключения к БД",
+                    f"Не удалось подключиться к базе данных:\n{exc}"
+                )
+                return None
+        
+        try:
+            # Load articles with clustering results
+            df = get_articles_with_clustering(self._db_conn)
+            return df
+        except Exception as exc:
+            messagebox.showerror(
+                "Ошибка загрузки данных",
+                f"Не удалось загрузить данные из базы:\n{exc}"
+            )
+            return None
 
     def _build_ui(self) -> None:
         pad = {"padx": 10, "pady": 6}
@@ -86,11 +203,19 @@ class VakClassifierApp(tk.Tk):
 
         self.btn_clear = ttk.Button(btn_row, text="Очистить", command=self._on_clear)
         self.btn_clear.pack(side=tk.LEFT, padx=(8, 0))
+        
+        self.btn_save = ttk.Button(
+            btn_row, 
+            text="💾 Сохранить результаты", 
+            command=self._on_save_results,
+            state=tk.DISABLED
+        )
+        self.btn_save.pack(side=tk.LEFT, padx=(8, 0))
 
         self.show_details = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             btn_row,
-            text="Подробнее (все 5 специальностей + semantic similarity)",
+            text="Подробнее (все 5 специальностей + TF-IDF)",
             variable=self.show_details,
             command=self._refresh_details,
         ).pack(side=tk.LEFT, padx=(16, 0))
@@ -111,7 +236,7 @@ class VakClassifierApp(tk.Tk):
         self.flag_label.pack(anchor="w", padx=8, pady=8)
 
         top_frame = ttk.LabelFrame(
-            self, text="Top-3 (основной результат - степень соответствия)"
+            self, text="Top-3 (основной результат - семантическое сходство)"
         )
         top_frame.pack(fill=tk.BOTH, expand=True, **pad)
 
@@ -122,7 +247,7 @@ class VakClassifierApp(tk.Tk):
         self.top_tree.heading("rank", text="№")
         self.top_tree.heading("code", text="Код ВАК")
         self.top_tree.heading("title", text="Специальность")
-        self.top_tree.heading("match", text="Соответствие")
+        self.top_tree.heading("match", text="Семант. сходство")
         self.top_tree.heading("hint", text="Примечание")
         self.top_tree.column("rank", width=40, anchor=tk.CENTER)
         self.top_tree.column("code", width=70, anchor=tk.CENTER)
@@ -133,21 +258,21 @@ class VakClassifierApp(tk.Tk):
 
         self.details_frame = ttk.LabelFrame(
             self,
-            text="Подробнее: все специальности (semantic similarity — смысловая близость, для справки)",
+            text="Подробнее: все специальности (TF-IDF — статистическое сходство, для справки)",
         )
         self.details_frame.pack(fill=tk.BOTH, expand=True, **pad)
 
-        dcols = ("code", "title", "match", "semantic", "rank_t", "rank_s")
+        dcols = ("code", "title", "match", "tfidf", "rank_s", "rank_t")
         self.details_tree = ttk.Treeview(
             self.details_frame, columns=dcols, show="headings", height=6
         )
         for cid, title, w in [
             ("code", "Код", 70),
             ("title", "Специальность", 380),
-            ("match", "Соответствие", 95),
-            ("semantic", "Semantic sim.", 95),
-            ("rank_t", "Ранг TF-IDF", 80),
-            ("rank_s", "Ранг embed", 80),
+            ("match", "Семант. сходство", 110),
+            ("tfidf", "TF-IDF sim.", 95),
+            ("rank_s", "Ранг Embedding", 90),
+            ("rank_t", "Ранг TF-IDF", 90),
         ]:
             self.details_tree.heading(cid, text=title)
             self.details_tree.column(cid, width=w, anchor=tk.CENTER if cid != "title" else tk.W)
@@ -157,8 +282,8 @@ class VakClassifierApp(tk.Tk):
         foot = ttk.Label(
             self,
             text=(
-                "Соответствие — min–max по 5 специальностям ВАК (TF-IDF), не вероятность. "
-                "Semantic similarity — сырой cosine эмбеддингов (режим «Подробнее»)."
+                "Семантическое сходство — сырой cosine similarity в процентаъ. "
+                "TF-IDF similarity — статистическое сходство терминов (режим «Подробнее»)."
             ),
             font=("Segoe UI", 8),
             foreground="#666",
@@ -282,7 +407,9 @@ class VakClassifierApp(tk.Tk):
         try:
             with self._classifier_lock:
                 if self._classifier is None:
-                    self._classifier = VakUiClassifier(VakUiConfig())
+                    # Используем score_mode='cosine' для сырого cosine similarity embeddings
+                    config = VakUiConfig(score_mode='cosine')
+                    self._classifier = VakUiClassifier(config)
             self.after(0, lambda: self.status_var.set("Готово. Введите текст и нажмите «Подобрать»."))
         except Exception as exc:
             self.after(
@@ -293,7 +420,9 @@ class VakClassifierApp(tk.Tk):
     def _get_classifier(self) -> VakUiClassifier:
         with self._classifier_lock:
             if self._classifier is None:
-                self._classifier = VakUiClassifier(VakUiConfig())
+                # Используем score_mode='cosine' для сырого cosine similarity embeddings
+                config = VakUiConfig(score_mode='cosine')
+                self._classifier = VakUiClassifier(config)
             return self._classifier
 
     def _collect_article_fields(self) -> Dict[str, str]:
@@ -308,6 +437,7 @@ class VakClassifierApp(tk.Tk):
         for widget in self._input_widgets:
             widget.delete("1.0", tk.END)
         self._clear_results()
+        self.btn_save.config(state=tk.DISABLED)
 
     def _clear_results(self) -> None:
         for tree in (self.top_tree, self.details_tree):
@@ -350,6 +480,7 @@ class VakClassifierApp(tk.Tk):
             clf = self._get_classifier()
             row = pd.Series(fields)
             result = clf.classify_row(row)
+            
             self.after(0, lambda: self._show_result(result))
         except Exception as exc:
             self.after(
@@ -362,27 +493,33 @@ class VakClassifierApp(tk.Tk):
     def _show_result(self, result: VakUiResult) -> None:
         self._last_result = result
         self._clear_results()
+        
+        # Включаем кнопку "Сохранить результаты"
+        self.btn_save.config(state=tk.NORMAL)
 
         flags = result.flags
         parts = []
         if flags.message:
             parts.append(flags.message)
         parts.append(
-            f"Разрыв 1–2 места (TF-IDF): {flags.ambiguous_gap:.3f}"
+            f"Разрыв 1–2 места (Embeddings): {flags.ambiguous_gap:.3f}"
             + (" - неоднозначно" if flags.ambiguous else "")
         )
         if flags.discrepancy:
             parts.append(
-                f"Расхождение: TF-IDF → {flags.tfidf_top1_code}, "
-                f"embed → {flags.semantic_top1_code}"
+                f"Расхождение: Embeddings → {flags.semantic_top1_code}, "
+                f"TF-IDF → {flags.tfidf_top1_code}"
             )
         self.flag_label.config(text="\n".join(parts))
 
+        # Отладка: проверяем, что top3 не пустой
+        print(f"DEBUG: result.top3 length = {len(result.top3)}")
         for i, item in enumerate(result.top3, start=1):
+            print(f"DEBUG: Item {i}: code={item.code}, match_score={item.match_score}")
             hint = ""
             if i == 1 and flags.ambiguous:
                 hint = "близкие 2-3 места"
-            if i == 1 and flags.discrepancy and flags.embed_alternative_code:
+            if i == 1 and flags.discrepancy and flags.tfidf_alternative_code:
                 hint = (hint + "; " if hint else "") + "см. подсказку выше"
             self.top_tree.insert(
                 "",
@@ -391,7 +528,7 @@ class VakClassifierApp(tk.Tk):
                     i,
                     item.code,
                     item.title[:120],
-                    f"{item.match_score * 100:.0f}%",
+                    f"{item.match_score * 100:.1f}%",
                     hint,
                 ),
             )
@@ -399,7 +536,9 @@ class VakClassifierApp(tk.Tk):
         self._refresh_details()
 
     def _refresh_details(self) -> None:
-        if self.show_details.get():
+        show_details = self.show_details.get()
+        
+        if show_details:
             self.details_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=6)
         else:
             self.details_frame.pack_forget()
@@ -418,12 +557,106 @@ class VakClassifierApp(tk.Tk):
                 values=(
                     item.code,
                     item.title[:100],
-                    f"{item.match_score * 100:.1f}%",
-                    f"{item.semantic_similarity:.3f}",
-                    item.rank_tfidf,
+                    f"{item.match_score * 100:.1f}%",  # Embeddings (сырой) - основной
+                    f"{item.tfidf_similarity:.3f}",    # TF-IDF (сырой) - дополнительный
                     item.rank_semantic,
+                    item.rank_tfidf,
                 ),
             )
+    
+    def _on_save_results(self) -> None:
+        """Сохранение результатов классификации в базу данных."""
+        if not self._last_result:
+            messagebox.showwarning(
+                "Нет результатов",
+                "Сначала выполните классификацию, затем сохраните результаты."
+            )
+            return
+        
+        if self._db_conn is None:
+            messagebox.showerror(
+                "База данных недоступна",
+                "Не удалось подключиться к базе данных.\n"
+                "Результаты не могут быть сохранены."
+            )
+            return
+        
+        try:
+            # Собираем данные из полей ввода
+            fields = self._collect_article_fields()
+            
+            # Получаем результаты классификации
+            result = self._last_result
+            
+            # Находим топ-1 по Embedding (основной метод)
+            top1_embed = result.top3[0] if result.top3 else None
+            
+            # Находим топ-1 по TF-IDF (дополнительный метод)
+            top1_tfidf = None
+            for spec in result.all_specialties:
+                if spec.rank_tfidf == 1:
+                    top1_tfidf = spec
+                    break
+            
+            # С новой логикой:
+            # - match_score содержит сырой cosine similarity для Embeddings (основной)
+            # - tfidf_similarity содержит сырой cosine similarity для TF-IDF (дополнительный)
+            
+            embed_score = top1_embed.match_score if top1_embed else None  # Embeddings (основной)
+            tfidf_score = top1_tfidf.tfidf_similarity if top1_tfidf else None  # TF-IDF (дополнительный)
+            
+            # Формируем JSON с топ-3
+            import json
+            top3_data = [
+                {
+                    'rank': i + 1,
+                    'code': item.code,
+                    'title': item.title,
+                    'match_score': item.match_score,  # Embeddings (основной)
+                    'tfidf_similarity': item.tfidf_similarity  # TF-IDF (дополнительный)
+                }
+                for i, item in enumerate(result.top3)
+            ]
+            
+            # Подготовка данных для сохранения
+            classification_data = {
+                'title': fields['title'] or '(без названия)',
+                'annotation': fields['annotation'],
+                'keywords': fields['keywords'],
+                'main_text': fields['main_text'],
+                'vak_tfidf_code': top1_tfidf.code if top1_tfidf else None,
+                'vak_tfidf_title': top1_tfidf.title if top1_tfidf else None,
+                'vak_tfidf_score': tfidf_score,  # Сырой cosine similarity (дополнительный)
+                'vak_embed_code': top1_embed.code if top1_embed else None,
+                'vak_embed_title': top1_embed.title if top1_embed else None,
+                'vak_embed_score': embed_score,  # Сырой cosine similarity (основной)
+                'top3_json': json.dumps(top3_data, ensure_ascii=False),
+                'is_ambiguous': 1 if result.flags.ambiguous else 0,
+                'has_discrepancy': 1 if result.flags.discrepancy else 0,
+                'notes': None
+            }
+            
+            # Сохранение в базу данных
+            saved_id = insert_saved_classification(self._db_conn, classification_data)
+            
+            # Уведомление пользователя
+            messagebox.showinfo(
+                "Результаты сохранены",
+                f"Результаты классификации успешно сохранены!\n\n"
+                f"ID записи: {saved_id}\n"
+                f"Embeddings (основной): {classification_data['vak_embed_code']}\n"
+                f"TF-IDF (дополнительный): {classification_data['vak_tfidf_code']}\n\n"
+                f"Вы можете просмотреть сохранённые результаты в базе данных."
+            )
+            
+        except Exception as exc:
+            messagebox.showerror(
+                "Ошибка сохранения",
+                f"Не удалось сохранить результаты:\n{exc}"
+            )
+            print(f"Error saving classification: {exc}", file=sys.stderr)
+            import traceback
+            traceback.print_exc()
 
 
 def main() -> None:
