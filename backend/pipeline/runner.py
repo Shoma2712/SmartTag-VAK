@@ -152,6 +152,9 @@ def run_full_pipeline() -> None:
             modeler.df["lda_topic"] = get_document_topics(modeler.lda_model, modeler.corpus)
             
             # Сохранение LDA results to database через метод модели
+            # Очистка старых результатов перед записью новых (UNIQUE на article_id)
+            conn.cursor().execute("DELETE FROM lda_results")
+            conn.commit()
             count = modeler.save_results_to_database(conn)
             
             # Проверка LDA results were written to database
@@ -290,6 +293,9 @@ def run_full_pipeline() -> None:
                     })
             
             if vak_results:
+                # Очистка старых результатов перед записью новых (UNIQUE на article_id)
+                conn.cursor().execute("DELETE FROM vak_results")
+                conn.commit()
                 count = insert_vak_results_batch(conn, vak_results)
                 print(f"\nРезультаты ВАК сохранены в БД: {count} записей")
                 

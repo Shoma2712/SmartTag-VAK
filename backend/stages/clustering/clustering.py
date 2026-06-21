@@ -406,6 +406,9 @@ class EmbeddingClusterer:
         df_out['cluster_name'] = df_out['cluster'].map(cluster_topic_map)
 
         # Сохраняем результаты кластеризации в базу данных
+        # Очистка старых результатов перед записью новых (UNIQUE на article_id)
+        conn.cursor().execute("DELETE FROM clustering_results")
+        conn.commit()
         clustering_results = []
         for _, row in df_out.iterrows():
             clustering_results.append({

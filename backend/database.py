@@ -28,7 +28,7 @@ def init_database(db_path):
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS lda_results (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            article_id INTEGER NOT NULL,
+            article_id INTEGER NOT NULL UNIQUE,
             lda_tokens TEXT,
             lda_topic_keywords TEXT,
             FOREIGN KEY (article_id) REFERENCES articles(id) ON DELETE CASCADE
@@ -39,7 +39,7 @@ def init_database(db_path):
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS clustering_results (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            article_id INTEGER NOT NULL,
+            article_id INTEGER NOT NULL UNIQUE,
             cluster_name TEXT,
             FOREIGN KEY (article_id) REFERENCES articles(id) ON DELETE CASCADE
         )
@@ -49,7 +49,7 @@ def init_database(db_path):
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS vak_results (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            article_id INTEGER NOT NULL,
+            article_id INTEGER NOT NULL UNIQUE,
             vak_embed_code TEXT,
             embed_cosine REAL,
             vak_tfidf_code TEXT,
@@ -666,9 +666,7 @@ def get_articles_with_clustering(conn):
         cursor.execute("""
             SELECT 
                 a.*,
-                c.cluster,
-                c.tsne_x,
-                c.tsne_y
+                c.cluster_name
             FROM articles a
             LEFT JOIN clustering_results c ON a.id = c.article_id
         """)
@@ -697,9 +695,12 @@ def get_articles_with_vak(conn):
         cursor.execute("""
             SELECT 
                 a.*,
-                v.vak_ui_json,
                 v.vak_tfidf_code,
-                v.vak_embed_code
+                v.vak_embed_code,
+                v.embed_cosine,
+                v.tfidf_cosine,
+                v.is_ambiguous,
+                v.has_discrepancy
             FROM articles a
             LEFT JOIN vak_results v ON a.id = v.article_id
         """)
@@ -712,123 +713,36 @@ def get_articles_with_vak(conn):
 
 # Операции с распределением кластер-ВАК
 
-def calculate_cluster_vak_distribution(conn):
+def get_cluster_vak_distribution(conn, method='embed', cluster_name=None):
     """
-    Вычисление распределения специальностей ВАК по кластерам через JOIN и GROUP BY.
-    
+    Получение статистики распределения кластер-ВАК из реальных таблиц.
+
     Аргументы:
         conn: SQLite объект соединения
-    
+        method: 'embed' или 'tfidf' — какую таблицу читать
+        cluster_name: str, опционально — фильтр по имени кластера
+
     Возвращает:
-        pandas.DataFrame: DataFrame с columns: cluster, vak_code, article_count
-    
+        pandas.DataFrame: DataFrame с columns: cluster_name, vak_code, article_count, percentage
+
     Исключения:
         sqlite3.Error: for ошибки базы данных
     """
+    table = 'cluster_vak_embed_distribution' if method == 'embed' else 'cluster_vak_tfidf_distribution'
     try:
         cursor = conn.cursor()
-        
-        # Вычисление distribution through JOIN and GROUP BY
-        cursor.execute("""
-            SELECT 
-                cr.cluster,
-                vr.vak_tfidf_code AS vak_code,
-                COUNT(*) AS article_count
-            FROM clustering_results cr
-            JOIN vak_results vr ON cr.article_id = vr.article_id
-            WHERE vr.vak_tfidf_code IS NOT NULL AND vr.vak_tfidf_code != ''
-            GROUP BY cr.cluster, vr.vak_tfidf_code
-            ORDER BY cr.cluster, article_count DESC
-        """)
-        rows = cursor.fetchall()
-        columns = [desc[0] for desc in cursor.description]
-        df = pd.DataFrame(rows, columns=columns)
-        
-        # Очистка existing distribution data
-        cursor.execute("DELETE FROM cluster_vak_distribution")
-        
-        # Вставка new distribution data
-        if not df.empty:
-            data = [
-                (row['cluster'], row['vak_code'], row['article_count'])
-                for _, row in df.iterrows()
-            ]
-            cursor.executemany("""
-                INSERT INTO cluster_vak_distribution (cluster, vak_code, article_count)
-                VALUES (?, ?, ?)
-            """, data)
-        
-        conn.commit()
-        return df
-    except sqlite3.Error as e:
-        conn.rollback()
-        raise sqlite3.Error(f"Error calculating cluster-VAK distribution: {e}") from e
-
-
-def insert_cluster_vak_distribution(conn, distribution_data):
-    """
-    Вставка данных распределения кластер-ВАК пакетным запросом.
-    
-    Аргументы:
-        conn: SQLite объект соединения
-        distribution_data: список словарей, каждый с ключами: cluster, vak_code, vak_title, article_count
-    
-    Возвращает:
-        int: количество строк (количество вставленных строк)
-    
-    Исключения:
-        sqlite3.Error: for ошибки базы данных
-    """
-    try:
-        cursor = conn.cursor()
-        data = [
-            (
-                item.get('cluster'),
-                item.get('vak_code'),
-                item.get('vak_title'),
-                item.get('article_count')
-            )
-            for item in distribution_data
-        ]
-        cursor.executemany("""
-            INSERT INTO cluster_vak_distribution (cluster, vak_code, vak_title, article_count)
-            VALUES (?, ?, ?, ?)
-        """, data)
-        conn.commit()
-        return cursor.rowcount
-    except sqlite3.Error as e:
-        conn.rollback()
-        raise sqlite3.Error(f"Error inserting cluster-VAK distribution: {e}") from e
-
-
-def get_cluster_vak_distribution(conn, cluster_id=None):
-    """
-    Получение статистики распределения кластер-ВАК.
-    
-    Аргументы:
-        conn: SQLite объект соединения
-        cluster_id: int, optional cluster ID to filter by
-    
-    Возвращает:
-        pandas.DataFrame: DataFrame с columns: cluster, vak_code, vak_title, article_count
-    
-    Исключения:
-        sqlite3.Error: for ошибки базы данных
-    """
-    try:
-        cursor = conn.cursor()
-        if cluster_id is not None:
-            cursor.execute("""
-                SELECT cluster, vak_code, vak_title, article_count
-                FROM cluster_vak_distribution
-                WHERE cluster = ?
+        if cluster_name is not None:
+            cursor.execute(f"""
+                SELECT cluster_name, vak_code, article_count, percentage
+                FROM {table}
+                WHERE cluster_name = ?
                 ORDER BY article_count DESC
-            """, (cluster_id,))
+            """, (cluster_name,))
         else:
-            cursor.execute("""
-                SELECT cluster, vak_code, vak_title, article_count
-                FROM cluster_vak_distribution
-                ORDER BY cluster, article_count DESC
+            cursor.execute(f"""
+                SELECT cluster_name, vak_code, article_count, percentage
+                FROM {table}
+                ORDER BY cluster_name, article_count DESC
             """)
         rows = cursor.fetchall()
         columns = [desc[0] for desc in cursor.description]
@@ -837,38 +751,39 @@ def get_cluster_vak_distribution(conn, cluster_id=None):
         raise sqlite3.Error(f"Error fetching cluster-VAK distribution: {e}") from e
 
 
-def get_vak_cluster_distribution(conn, vak_code=None):
+def get_vak_cluster_distribution(conn, vak_code=None, method='embed'):
     """
-    Получение кластеров, содержащих определенную специальность ВАК.
-    
+    Получение распределения конкретной специальности ВАК по кластерам.
+
     Аргументы:
         conn: SQLite объект соединения
-        vak_code: str, optional VAK code to filter by
-    
+        vak_code: str, опционально — фильтр по коду специальности
+        method: 'embed' или 'tfidf' — какую таблицу читать
+
     Возвращает:
         pandas.DataFrame: DataFrame с distribution information
-    
+
     Исключения:
         sqlite3.Error: for ошибки базы данных
     """
+    table = 'cluster_vak_embed_distribution' if method == 'embed' else 'cluster_vak_tfidf_distribution'
     try:
         cursor = conn.cursor()
         if vak_code is not None:
-            cursor.execute("""
-                SELECT cluster, vak_code, vak_title, article_count
-                FROM cluster_vak_distribution
+            cursor.execute(f"""
+                SELECT cluster_name, vak_code, article_count, percentage
+                FROM {table}
                 WHERE vak_code = ?
                 ORDER BY article_count DESC
             """, (vak_code,))
         else:
-            cursor.execute("""
-                SELECT 
+            cursor.execute(f"""
+                SELECT
                     vak_code,
-                    vak_title,
-                    COUNT(DISTINCT cluster) as cluster_count,
+                    COUNT(DISTINCT cluster_name) as cluster_count,
                     SUM(article_count) as total_articles
-                FROM cluster_vak_distribution
-                GROUP BY vak_code, vak_title
+                FROM {table}
+                GROUP BY vak_code
                 ORDER BY total_articles DESC
             """)
         rows = cursor.fetchall()

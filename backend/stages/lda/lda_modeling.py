@@ -380,6 +380,9 @@ class LDATopicModeler:
         
         # Вставляем результаты в базу данных
         try:
+            # Очистка старых результатов перед записью новых (UNIQUE на article_id)
+            conn.cursor().execute("DELETE FROM lda_results")
+            conn.commit()
             rowcount = insert_lda_results_batch(conn, results_list)
             print(f"Сохранено {rowcount} результатов LDA в базу данных")
             return rowcount
